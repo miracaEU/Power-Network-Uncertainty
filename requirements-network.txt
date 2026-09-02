@@ -1,0 +1,45 @@
+# Network-level additions on top of the direct-damage stack.
+#
+# Install into a venv OUTSIDE OneDrive, separate from ~/.venvs/miraca_uq so the
+# running paper-1 cluster campaign cannot be disturbed:
+#
+#   uv venv %USERPROFILE%\.venvs\miraca_net --python 3.12
+#   $py = "$env:USERPROFILE\.venvs\miraca_net\Scripts\python.exe"
+#   uv pip install --python $py -r ..\Uncertainty-Modelling\requirements.txt
+#   uv pip install --python $py -r requirements-network.txt
+#   uv pip install --python $py -e ..\Uncertainty-Modelling
+#
+# pandapower 3.x, NOT 2.14.11
+# ---------------------------
+# The MIRACA D3.3 code has two incompatible generations in play - UC5 pins
+# 2.14.11 and uses the 2.x net.bus_geodata / net.line_geodata API, while
+# spof_electrical_analysis.py carries 3.x workarounds. We commit to 3.x, for
+# two measured reasons (BENCHMARK.md, "Environment note"):
+#
+#   * 2.14.11 is incompatible with pandas 3.x - it writes into `.values` in
+#     place, and copy-on-write makes those arrays read-only.
+#   * Installing it drags numpy back to 1.26 and scipy to 1.13.1, diverging
+#     from the direct-damage stack Stage 1 was produced with.
+#
+# power_net/network.py::conform_to_schema translates the 2.x-era Energy Model
+# CSVs to whatever version is installed, so the 3.x column renames
+# (tap_phase_shifter -> tap_changer_type, const_z_percent -> const_z_p_percent)
+# are handled rather than hard-coded.
+pandapower>=3.5.4
+
+# scipy >= 1.15 is REQUIRED, not incidental: ema_workbench 3.0's LHS sampler
+# calls scipy.stats.qmc.LatinHypercube(rng=...), and `rng` only exists from
+# 1.15 (it replaced `seed`). Older scipy fails at sample generation with
+#   TypeError: LatinHypercube.__init__() got an unexpected keyword argument 'rng'
+# which is exactly what the old pandapower==2.14.11 pin silently produced on
+# the cluster. Stated explicitly so no resolver can quietly satisfy it with 1.13.
+scipy>=1.15
+
+# Island decomposition and the electrical neighbourhood used to localise the
+# OPF. scipy.sparse.csgraph does the heavy lifting; networkx is used for the
+# k-hop neighbourhood and for pandapower.topology.
+networkx
+
+# pandapower warns on every solve without it and falls back to a slower
+# admittance-matrix build.
+numba

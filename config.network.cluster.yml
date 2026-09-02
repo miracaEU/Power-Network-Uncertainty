@@ -1,0 +1,43 @@
+# Cluster (Linux) configuration for the network-level study.
+#
+# Identical to config.network.yml except that every path is the Linux form of
+# the same SCISTOR storage: S:\ on Windows is /scistor/ivm on the cluster, so
+# "S:/yma794/..." becomes "/scistor/ivm/yma794/...".
+#
+# Because the Energy Model drop lives inside this repo (on the shared drive),
+# the cluster sees it at the same relative path with no copying.
+#
+# Select it with MIRACA_NET_CONFIG; submit_network_study.sh exports it for you:
+#   export MIRACA_NET_CONFIG=/scistor/ivm/$USER/Power-Network-Uncertainty/config.network.cluster.yml
+
+country: LUX
+asset_type: power
+
+# --- Stage 1 output from the direct-damage study ------------------------------
+# NOT recomputed here. This must point at the intermediate/ folder of the
+# Uncertainty-Modelling clone that ran Stage 1 for the `power` asset.
+# Override with NET_INTERMEDIATE_DIR if your clone lives elsewhere.
+intermediate_dir: "/scistor/ivm/yma794/Uncertainty-Modelling/data/intermediate"
+results_dir: "results"
+cache_dir: "cache"
+
+# Relative to the repo root, so it resolves on both platforms.
+energy_model_dir: "Energy Model"
+
+vulnerability_path: "/scistor/ivm/eks510/projects/AssetRisk_PanEU/data/Table_D2_Hazard_Fragility_and_Vulnerability_Curves_V1.1.0_conversions.xlsx"
+fragility_path: "/scistor/ivm/eks510/projects/AssetRisk_PanEU/data/EQ_fragility.xlsx"
+basin_data_path: "/scistor/ivm/eks510/projects/AssetRisk_PanEU/data/basins_abs_shift_return_periods.parquet"
+
+network:
+  reference_timestamp: "2018-01-24T17:00:00Z"
+  timing_archetype: winter_peak
+  voll_eur_mwh: 10000.0
+  outage_window_hours: 24.0
+  unmatched_bus_policy: immune
+  snap_max_m: 25000.0
+  intensity_aggregation: max
+  load_disaggregation: equal
+  # Off: with the equal-split disaggregation 12.9% of lines already exceed
+  # 100% loading before any hazard, so a limited OPF does not converge even in
+  # the base case. See BENCHMARK.md.
+  thermal_limits: false

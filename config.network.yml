@@ -1,0 +1,48 @@
+# Network-level uncertainty study configuration (Windows / S: drive).
+#
+# Stage 1 (hazard intensities per OSM feature) is NOT recomputed here: it is
+# read from the direct-damage repo's intermediate/ folder, which already holds
+# validated `power` output. `intermediate_dir` therefore points at that repo.
+# On the cluster use config.network.cluster.yml instead (MIRACA_NET_CONFIG).
+
+country: LUX
+asset_type: power          # the direct-damage asset whose Stage 1 output we reuse
+
+# --- where Stage 1 output already lives ---------------------------------------
+intermediate_dir: "S:/yma794/Uncertainty-Modelling/data/intermediate"
+results_dir: "results"
+cache_dir: "cache"
+
+# --- Energy Model drop (grid, demand, plants) ---------------------------------
+energy_model_dir: "Energy Model"
+
+# --- curve / fragility tables (shared with the direct-damage study) -----------
+vulnerability_path: "S:/eks510/projects/AssetRisk_PanEU/data/Table_D2_Hazard_Fragility_and_Vulnerability_Curves_V1.1.0_conversions.xlsx"
+fragility_path: "S:/eks510/projects/AssetRisk_PanEU/data/EQ_fragility.xlsx"
+basin_data_path: "S:/eks510/projects/AssetRisk_PanEU/data/basins_abs_shift_return_periods.parquet"
+
+# --- network model ------------------------------------------------------------
+network:
+  # Hour of the OPSD series used as the reference operating point. Timing
+  # archetypes (power_net/demand.py::ARCHETYPES) select other hours; this is
+  # the default when no archetype is named.
+  reference_timestamp: "2018-01-24T17:00:00Z"
+  voll_eur_mwh: 10000.0
+  # Hours of outage assumed per failed-component event. ENS = shed_MW * window.
+  # A conditioning constant, not a sampled factor: sweeps are post-processing.
+  outage_window_hours: 24.0
+  # Buses with no OSM identifier (synthetic PyPSA-Eur nodes, ~27% pan-EU)
+  # cannot be joined to the hazard exposure. "immune" leaves them unexposed
+  # (understates risk, states the limitation); "nearest" assigns them the
+  # hazard of the nearest matched bus within snap_max_m.
+  unmatched_bus_policy: immune
+  snap_max_m: 25000.0
+  # Aggregation from many OSM features to one grid component. "max" is immune
+  # to both damagescanner defects by construction (they corrupt quantity /
+  # cell coverage, never intensity); "qty_weighted" is not.
+  intensity_aggregation: max
+  # Equal split of national demand across a country's buses, matching the
+  # existing D3.3 behaviour. "nuts3" (population/GDP weights) is implemented
+  # but off by default - switching it changes where load sits, and therefore
+  # every ENS number.
+  load_disaggregation: equal

@@ -1,0 +1,13 @@
+# Input-data snapshot, not source. Downloaded separately (PyPSA-Eur
+# osm-prebuilt base network + OPSD + powerplantmatching + Eurostat).
+Energy Model/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Stage 1b / Stage 2 artefacts
+cache/
+results/
+*.tar.gz
