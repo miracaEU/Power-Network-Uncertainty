@@ -54,6 +54,45 @@ box bounds), which `scipy.optimize.linprog` with HiGHS solves in milliseconds
 once the PTDF is built. pandapower would then serve as the reference
 implementation to validate against rather than the inner loop.
 
+## The escape hatch, taken (2026-09-10)
+
+`power_net/dcopf_lp.py` implements exactly that, and is now the default
+(`opf_backend: highs`). One departure from the sketch above: it is a **B-theta**
+formulation, not PTDF. PTDF here would be dense at 9,869 branches x 6,737 buses
+(~530 MB) and needs a matrix inverse, whereas B-theta stays sparse and lets an
+outage be applied by zeroing a single branch susceptance. Susceptances are read
+from pandapower's own `BR_X`/`TAP`, so the impedance and tap conversion is still
+pandapower's arithmetic rather than a reimplementation.
+
+Measured on the same reference hour, equal-split load:
+
+| | time | shed | over 100% | worst line |
+|---|---|---|---|---|
+| pandapower, economic, no limits | 24.7 s | 3,291.9 MW | 1,163 | 1,668% |
+| HiGHS, economic, no limits | **0.9 s** | **3,291.9 MW** | 1,201 | 1,668% |
+| HiGHS, min-shed, no limits | 0.8 s | 3,291.9 MW | **333** | **298%** |
+| HiGHS, min-shed, **limits ON** | 6.3 s | 3,507.7 MW | 0 | **100%** |
+| HiGHS, economic, **limits ON** | 3.9 s | 3,507.7 MW | 0 | **100%** |
+
+**The thermal-limit non-convergence above was a solver failure, not an
+infeasibility.** A feasible point always exists - shed everything, generate
+nothing, zero flow on every branch - and HiGHS finds it in seconds where PIPS
+could not converge at all. Enforcing the ratings costs 216 MW of unavoidable
+shedding that the unconstrained solve hid.
+
+Validation, since "faster" is worthless if it is a different model:
+
+- **Shed matches to +0.000 MW** on the like-for-like case (economic, no limits).
+- **Line flows match to 3.8e-5 MW** against a 622 MW mean, correlation
+  1.0000000000, with the dispatch held fixed at pandapower's own optimum. The
+  larger discrepancies seen when both solvers choose their own dispatch are
+  degeneracy - fuel-type costs make many dispatches tie - not a model difference.
+- **Stranded load is counted.** De-energising bus 5758 (262.5 MW) moves the shed
+  by exactly +262.5 MW; the pandapower path moved it by +0.0.
+- **End-to-end on LUX**, `network_model=dc_opf`: pandapower returns
+  **0.0000 MWh** (the known regression), HiGHS returns **17.7617 MWh**, matching
+  the connectivity model, in 3.4 s against 91.4 s.
+
 ## The thermal-limit non-convergence
 
 With `max_loading_percent = 100` on every line the OPF fails. The cause is
@@ -61,12 +100,39 @@ visible in the no-limits solve: **12.9% of lines (1,163 of 8,994) are already
 over 100%, with a maximum of 1,668%**, before any hazard is applied. The base
 case is massively infeasible to begin with.
 
-This is expected and is very likely an artefact of the **placeholder** load
-disaggregation used for the benchmark (each country's demand split equally
-across its buses), which puts load where none exists and creates unphysical
-flows. It is *not* yet evidence of a problem with the network data. The proper
-NUTS3 population/GDP disaggregation must land before this is re-tested or any
-loading figure is interpreted.
+The original reading of this was that it is "very likely an artefact of the
+**placeholder** load disaggregation" - each country's demand split equally
+across its buses, putting load where none exists - and that the proper NUTS3
+disaggregation had to land before the figure meant anything.
+
+**Tested 2026-09-09, and that reading is wrong.** With NUTS3
+population/GDP disaggregation (`load_disaggregation: nuts3`, see
+`power_net/disaggregation.py`) the same no-limits DC OPF at the same reference
+hour gives:
+
+| | over 100% | max loading | p90 / p99 | structural shed |
+|---|---|---|---|---|
+| `equal` | 1,163 (12.9%) | 1,668% | 118% / 307% | 3,292 MW |
+| `nuts3` | 1,282 (14.3%) | 1,722% | 126% / 315% | 3,295 MW |
+
+Moving load onto population and GDP makes the base case *slightly worse*, not
+better. So the infeasibility is not the load disaggregation, and no loading
+figure should be blamed on it any more.
+
+**The leading candidate is now the missing HVDC layer.**
+`Net_structure_data/links.csv` holds 38 DC links totalling **32,530 MW**, and
+`converters.csv` a further 67 converters; every one of the 76 link endpoints
+resolves to a real bus in the network, none is under construction, and
+`build_base_network` reads none of them - it loads only `bus_data`,
+`line_data`, `trafo_data` and `bus_geodata`. Adding those links as edges
+collapses the topology from **76 connected components to 40** (largest
+component 5,486 -> 6,104 buses), which means 36 of the islands behind the
+3.3 GW structural floor are not electrical islands at all. Power that should
+move by DC is currently forced onto the AC network, which is exactly the shape
+of defect that produces overloads no redispatch can relieve.
+
+This is a hypothesis with a strong prior, not yet a demonstration: nobody has
+re-run the limited OPF with the links in. That is the next measurement.
 
 ## Incidental findings worth keeping
 
@@ -76,6 +142,23 @@ loading figure is interpreted.
   load-shedding formulation is behaving correctly. It also confirms the plan's
   concern that some "islands" are topology artefacts: that floor would
   otherwise be reported as hazard-driven ENS.
+
+  **Resolved 2026-09-14: the floor is entirely an artefact, and the "islands"
+  are not islands.** 70 of the 76 components are single buses, and all 70 are
+  HVDC converter terminals whose only connections live in `links.csv` and
+  `converters.csv` - files `build_base_network` never read. The load
+  disaggregation then handed those DC nodes 6,766 MW of national demand, which
+  had no supply path and was shed in full. Setting either
+  `exclude_dc_terminal_load: true` (remove the phantom load) or
+  `include_hvdc: true` (give it a path) drops the structural floor from
+  3,522 MW to **exactly 0.0 MW**, independently. With `include_hvdc` the
+  topology goes from 76 components to **1** - Europe is a single connected
+  graph once the DC layer exists, which is what the real network is.
+
+  EAENS was not biased by this, because `_event_energy` subtracts a no-hazard
+  baseline computed the same way, so the artefact cancels. What it did corrupt
+  is the `structural_floor_MW` diagnostic and every statement made about it -
+  including the one above.
 - **Topology**: 206 components from lines alone (largest 1,022); **76
   components including transformers** (largest 5,486), 70 singletons. Matches
   D3.3's reported figures.

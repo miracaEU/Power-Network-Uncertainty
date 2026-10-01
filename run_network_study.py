@@ -11,19 +11,27 @@ cluster campaign restartable after a walltime kill without redoing finished
 work - the same skip-token pattern the direct-damage orchestrator uses.
 
 Scenarios that do not apply to a country are skipped automatically (coastal for
-landlocked countries; any hazard Stage 1 did not preprocess).
+landlocked countries; any hazard Stage 1 did not preprocess). So are STRUCTURAL
+ZEROS - the hazard applies, but no grid component in the country's owned basins
+is exposed (power_net/exposure_screen.py). Those are not dropped silently: each
+leaves results/<ISO3>/structural_zero_<ISO3>_<scenario>.json stating EAENS = 0
+and the reason, so they stay a reported result category without costing a run.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from power_net.demand import ARCHETYPES, DURATION_SAMPLING
-from power_net.ema_model import DEFAULT_SCENARIOS, SCENARIOS, applicable_scenarios
+from power_net.ema_model import (DEFAULT_SCENARIOS, SCENARIO_HAZARD, SCENARIOS,
+                                 applicable_scenarios)
+from power_net.exposure_screen import (LABELS, STRUCTURAL_ZEROS,
+                                       record_structural_zero, screen)
 from power_net.paths import (
     country_results_dir,
     load_config,
@@ -45,9 +53,20 @@ def result_exists(country: str, scenario: str, archetype: str, sampler: str,
     if not d.is_dir():
         return False
     variant = f"_{duration}" + ("_hourly" if hourly else "")
+    # The `n` must be delimited, not a prefix: `n{n}*` let `--n 4` match an
+    # existing `_n400_*.tar.gz`, so a 4-run smoke test read as a finished
+    # 400-run campaign. run_experiments.py writes `..._n{n}{tag}_{stamp}.tar.gz`
+    # with tag either empty or `_<tag>`, so anchor on the `_` before the stamp
+    # and reject anything that continues the digits.
     pattern = (f"experiments_{country}_powergrid_{scenario}_{archetype}{variant}_"
-               f"{sampler}_n{n}*.tar.gz")
-    return any(d.glob(pattern))
+               f"{sampler}_n{n}_*.tar.gz")
+    hits = [p for p in d.glob(pattern)]
+    # A tagged run is a smoke test or a variant, not the real campaign - `--tag`
+    # was absent from the pattern entirely, so any tagged run marked the
+    # combination done. Accept only untagged results: `_n<N>_<stamp>.tar.gz`,
+    # where the stamp is exactly YYYYmmdd_HHMMSS.
+    stamp = re.compile(rf"_n{n}_\d{{8}}_\d{{6}}\.tar\.gz$")
+    return any(stamp.search(p.name) for p in hits)
 
 
 def run_one(country: str, scenario: str, archetype: str, sampler: str, n: int,
@@ -89,6 +108,10 @@ def main() -> None:
     p.add_argument("--duration-sampling", choices=DURATION_SAMPLING, default="fixed")
     p.add_argument("--hourly-resolve", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--plan-out", type=Path, default=None,
+                   help="write the runnable 'COUNTRY SCENARIO' pairs to this file "
+                        "(what submit_network_study.sh submits; ignores done-ness, "
+                        "which depends on the variant)")
     args = p.parse_args()
 
     def _clean(values, valid, what):
@@ -104,13 +127,23 @@ def main() -> None:
         args.scenarios = _clean(args.scenarios, set(SCENARIOS), "scenario")
 
     scenarios = args.scenarios or DEFAULT_SCENARIOS
-    planned, skipped = [], []
+    planned, skipped, runnable = [], [], []
     for country in args.countries:
         ok = set(applicable_scenarios(country))
         for scenario in scenarios:
             if scenario not in ok:
                 skipped.append((country, scenario, "hazard not applicable"))
                 continue
+            set_country_override(country)
+            set_scenario_override(scenario)
+            cfg = load_config()
+            info = screen(cfg, SCENARIO_HAZARD[scenario])
+            if info["status"] in STRUCTURAL_ZEROS:
+                record_structural_zero(cfg, scenario, info)
+                skipped.append((country, scenario,
+                                f"{LABELS[info['status']]} -> EAENS = 0 (recorded)"))
+                continue
+            runnable.append((country, scenario))
             for archetype in args.archetypes:
                 if not args.force and result_exists(
                         country, scenario, archetype, args.sampler, args.n,
@@ -124,6 +157,9 @@ def main() -> None:
         print(f"  skip {c:4s} {s:24s} {why}")
     for c, s, a in planned:
         print(f"  run  {c:4s} {s:24s} {a}")
+    if args.plan_out is not None:
+        args.plan_out.write_text("".join(f"{c} {s}\n" for c, s in runnable),
+                                 newline="\n")
     if args.dry_run:
         return
 

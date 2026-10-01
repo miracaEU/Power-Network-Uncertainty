@@ -17,7 +17,12 @@ cache_dir: "cache"
 energy_model_dir: "Energy Model"
 
 # --- curve / fragility tables (shared with the direct-damage study) -----------
-vulnerability_path: "S:/eks510/projects/AssetRisk_PanEU/data/Table_D2_Hazard_Fragility_and_Vulnerability_Curves_V1.1.0_conversions.xlsx"
+# V3.0.0 since 2026-09-17. It adds F_Frag_Depth, which carries the first
+# published flood FRAGILITY curves for power (F2.4, F2.5 substations) - the gap
+# that the study's invented depth->failure mapping used to fill. All 31 curve
+# IDs the study already declared are bit-identical to V1.1.0, so the earthquake
+# and windstorm numbers are unaffected by the swap.
+vulnerability_path: "Energy Model/Table_D2_Multi-Hazard_Fragility_and_Vulnerability_Curves_V3.0.0_AUTH.xlsx"
 fragility_path: "S:/eks510/projects/AssetRisk_PanEU/data/EQ_fragility.xlsx"
 basin_data_path: "S:/eks510/projects/AssetRisk_PanEU/data/basins_abs_shift_return_periods.parquet"
 
@@ -41,8 +46,93 @@ network:
   # to both damagescanner defects by construction (they corrupt quantity /
   # cell coverage, never intensity); "qty_weighted" is not.
   intensity_aggregation: max
-  # Equal split of national demand across a country's buses, matching the
-  # existing D3.3 behaviour. "nuts3" (population/GDP weights) is implemented
-  # but off by default - switching it changes where load sits, and therefore
-  # every ENS number.
-  load_disaggregation: equal
+  # Where a country's national demand sits on its buses. Changing this changes
+  # every ENS number, because ENS is exactly "how much load sat at the buses
+  # that got disconnected".
+  #   equal      split evenly across a country's buses - the D3.3 placeholder,
+  #              kept as the default so existing results stay comparable.
+  #   nuts3      weight by NUTS3 population and GDP (see nuts3_gdp_weight)
+  #   nuts3_pop  population only
+  #   nuts3_gdp  GDP only
+  # Countries with no NUTS3 geometry (GB, UA, BA, MD) or no Eurostat NUTS3
+  # statistics (NO, XK) fall back to the equal split individually and are
+  # listed in the run's disagg_report. LUX is a single NUTS3 region, so for LUX
+  # the nuts3 modes reproduce the equal split exactly.
+  # Event footprint. HydroBASINS level 07 for every hazard, matching the partner
+  # analyses. NOTE "basin" is level 08 (raw HYBAS_ID, 10,309 pan-EU); level 07
+  # is the coarser 3,335-basin partition and is what this study uses.
+  event_footprint: basin_lev07
+  # nuts3 with the pop/GDP blend sampled as `nuts3_gdp_weight`; "equal" is
+  # retired - it was a placeholder that put demand where no demand is.
+  load_disaggregation: nuts3
+  # Reference year for the Eurostat statistics; the most recent observation at
+  # or before it is used per region. 2021 has the widest joint coverage.
+  nuts3_year: 2021
+  # Blend for mode "nuts3": w = (1 - x) * population share + x * GDP share,
+  # normalised within each country.
+  nuts3_gdp_weight: 0.5
+
+  # --- how the DC OPF is posed and solved -------------------------------------
+  # "highs"      power_net/dcopf_lp.py: the DC OPF written as an explicit sparse
+  #              LP and solved with HiGHS through scipy.optimize.linprog.
+  # "pandapower" the original rundcopp path (PYPOWER -> PIPS), kept as a
+  #              cross-check. Same model - with the dispatch held fixed the two
+  #              agree on every line flow to 4e-5 MW against a 622 MW mean - but
+  #              PIPS is ~25x slower, cannot converge with thermal limits on,
+  #              and drops load stranded at a de-energised bus instead of
+  #              counting it, which is what made dc_opf return exactly 0.000.
+  # --- the HVDC layer ----------------------------------------------------------
+  # Read Net_structure_data/links.csv (38 DC links, 32,530 MW) and
+  # converters.csv (67 AC/DC converters) and wire them in: as capacity-bounded
+  # controllable transfers in the LP, as plain edges in the connectivity model.
+  # ON since 2026-09-16. With it off, the 70 DC converter terminals sit as
+  # degree-0 buses and the topology reads 76 connected components; with it on,
+  # Europe is a single connected graph, which is what the real network is.
+  # Links join DC terminal to DC terminal, so converters.csv is what actually
+  # couples the layer to the AC grid - reading links alone would build 2-bus DC
+  # islands that never touch it. Both files join on the EXACT bus name.
+  include_hvdc: true
+  # A converter terminal is a station, not a demand centre, so it should never
+  # receive a share of national demand. ON since 2026-09-16. With it off, 6,766
+  # MW (1.36% of European demand) sits on 70 buses that then shed 100% of it -
+  # 53% of all shed MW in the base case. Independent of include_hvdc, and needed
+  # alongside it: include_hvdc alone gives that phantom demand a supply path, so
+  # the grid SERVES load that does not exist, using real generation and real
+  # transmission headroom. 3 terminals appear in links.csv but in no converter
+  # row, so they stay isolated even with the DC layer on; this switch is what
+  # keeps load off them.
+  exclude_dc_terminal_load: true
+
+  opf_backend: highs
+  # "economic"   fuel-type merit order plus VoLL. What a system operator
+  #              actually does: dispatch by merit order SUBJECT TO the network.
+  #              Default since 2026-09-16. With thermal_limits on it gives the
+  #              same shed as min_shed - VoLL is 125-2000x any fuel cost, so both
+  #              minimise unserved energy first and only then choose among the
+  #              dispatches that achieve it - but ~3x faster, because the cost
+  #              gradient gives the simplex a direction where min_shed is
+  #              massively degenerate.
+  # "min_shed"   generation effectively free, only unserved energy priced. The
+  #              purer reliability formulation, and the cheaper one to defend at
+  #              review since it imports no fuel-cost assumptions. Same answer,
+  #              slower.
+  # NOTE both objectives are only safe WITH thermal_limits. Unconstrained,
+  # "economic" ships cheap generation across the continent unchecked - it pushed
+  # 42 GW across a France-Spain border whose real NTC is about 2.8 GW.
+  dispatch_objective: economic
+  # Enforce line and transformer ratings. ON since 2026-09-16: this is the only
+  # configuration in which the base case is a physically possible operating
+  # point, and the only one in which the DC OPF earns its cost over the
+  # connectivity model - capacity-constrained shedding is the one failure mode
+  # connectivity cannot see, and with limits off no capacity ever binds.
+  # Solvable only under the highs backend; PIPS could not converge with limits.
+  thermal_limits: true
+  # AL, BA, MD, MK, XK have no OPSD demand series, so their 85 buses carry zero
+  # load but keep 11.53 GW of generation - in the base case they dispatch
+  # 6.7 GW with nothing to serve, making Bosnia the 4th largest exporter in the
+  # model. `keep_generation` leaves that alone (the honest picture of the input
+  # data); `neutral` also switches their generation off, so they are pure
+  # transit. EAENS is insensitive either way (<0.03%, both signs - see
+  # `_apply_zero_load_policy`), because ENS is a difference of two solves that
+  # both contain the artefact and the residual shed is delivery-limited.
+  zero_load_country_policy: keep_generation

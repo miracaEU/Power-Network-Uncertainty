@@ -56,46 +56,41 @@ from miraca_uq.risk_model import WARMING_LEVELS
 
 from .ens_model import FOOTPRINT_LEVELS, NETWORK_MODELS, NetData, compute_ens, load_net_data
 from .demand import DURATION_RANGE_H
-from .fragility import EQ_FRAGILITY, FLOOD_CURVES, FLOOD_MAPPINGS, WIND_FRAGILITY
+from . import fragility as frag
 from .paths import load_config
 
+# One scenario per hazard. The flood and coastal triplets
+# (baseline/absprot/noprot) existed only to vary flood protection three ways
+# INSIDE the model; protection is now a post-hoc factor applied to the stored
+# event table (scripts/postprocess_factors.py), so a single run per hazard
+# serves every protection assumption. `net_windstorm_absprot` is gone for the
+# same reason - and because it never did anything: it sampled
+# `protection_abs_rp`, which ens_model only ever read for river and coastal, so
+# it was numerically identical to `net_windstorm`.
 SCENARIOS = [
-    "net_flood_baseline", "net_flood_absprot", "net_flood_noprot",
-    "net_coastal_baseline", "net_coastal_absprot", "net_coastal_noprot",
-    "net_earthquake",
-    "net_windstorm", "net_windstorm_absprot",
+    "net_flood", "net_coastal", "net_earthquake", "net_windstorm",
 ]
 
-# The subset the orchestrator runs by default; the rest stay available via
-# --scenarios. Mirrors the direct-damage study's choice of the absolute- and
-# no-protection treatments plus the two non-flood hazards.
-DEFAULT_SCENARIOS = [
-    "net_flood_absprot",
-    "net_flood_noprot",
-    "net_earthquake",
-    "net_windstorm",
-]
+DEFAULT_SCENARIOS = list(SCENARIOS)
 
 SCENARIO_HAZARD = {
-    "net_flood_baseline": "river", "net_flood_absprot": "river",
-    "net_flood_noprot": "river",
-    "net_coastal_baseline": "coastal", "net_coastal_absprot": "coastal",
-    "net_coastal_noprot": "coastal",
+    "net_flood": "river",
+    "net_coastal": "coastal",
     "net_earthquake": "earthquake",
-    "net_windstorm": "windstorm", "net_windstorm_absprot": "windstorm",
-}
-
-_PROT_TREATMENT = {
-    "net_flood_baseline": "scale", "net_flood_absprot": "abs",
-    "net_flood_noprot": "fixed",
-    "net_coastal_baseline": "scale", "net_coastal_absprot": "abs",
-    "net_coastal_noprot": "fixed",
+    "net_windstorm": "windstorm",
 }
 
 OUTCOMES = [
     "EAENS_MWh", "EAENS_GWh", "peak_unserved_MW_RP100",
     "n_failed_RP100", "n_solves", "n_footprints", "structural_floor_MW",
     "load_shape_hours", "outage_hours",
+    # Both were computed by compute_ens and silently discarded: EMA binds
+    # outcomes by name, so a key absent from this list never reaches disk.
+    # n_opf_fallback is the ONLY signal that a result came from the connectivity
+    # model after an LP failure rather than from the DC OPF; n_unbasined is the
+    # number of the study country's components that carry no HydroBASINS id and
+    # therefore sit in the residual footprint.
+    "n_opf_fallback", "n_unbasined",
 ]
 
 _DATA_CACHE: dict[tuple[str, str], NetData] = {}
@@ -133,10 +128,14 @@ def applicable_scenarios(country: str | None = None) -> list[str]:
 
 
 def _fragility_params(hazard: str) -> list:
-    """One curve-choice factor per component kind, for whichever table applies."""
-    groups = {"windstorm": WIND_FRAGILITY, "earthquake": EQ_FRAGILITY}.get(
-        hazard, FLOOD_CURVES
-    )
+    """One curve-choice factor per component kind that HAS curves for this hazard.
+
+    A kind absent from the hazard's group table gets no parameter at all, not a
+    placeholder: under flood only `bus` has published fragility (F2.4 / F2.5),
+    so `curve_line` simply does not exist for flood scenarios and `_p_fail`
+    returns zeros for lines.
+    """
+    groups = frag.GROUPS_FOR_HAZARD[hazard]
     out = []
     for kind, ids in sorted(groups.items()):
         if len(ids) > 1:
@@ -147,15 +146,21 @@ def _fragility_params(hazard: str) -> list:
 
 
 def _shared_params() -> list:
-    """Factors every scenario carries, regardless of hazard."""
+    """Factors every scenario carries, regardless of hazard.
+
+    `event_footprint`, `network_model` and `slack_placement` were all sampled
+    here and are now constants or gone - see build_model for why.
+    """
     return [
-        CategoricalParameter("event_footprint", FOOTPRINT_LEVELS),
-        CategoricalParameter("network_model", NETWORK_MODELS),
-        CategoricalParameter("slack_placement",
-                             ["per_country", "per_synchronous_area"]),
         RealParameter("failure_correlation", 0.0, 0.8),
         RealParameter("gen_availability", 0.5, 1.0),
         IntegerParameter("failure_seed", 0, 999),
+        # Where demand sits, as a continuous blend: 0 = pure NUTS3 population,
+        # 1 = pure NUTS3 GDP. Measured spread at winter peak with thermal limits
+        # on was 3,411 MW (pop+GDP) to 5,267 MW (GDP-only) of shed, larger than
+        # several factors already here, and pop-only shed zero at every hour
+        # tested while GDP-only was the only mode with material shed.
+        RealParameter("nuts3_gdp_weight", 0.0, 1.0),
     ]
 
 
@@ -181,20 +186,18 @@ def build_model(cfg: dict | None = None) -> Model:
         (uncertainties if isinstance(p, CategoricalParameter) else constants).append(p)
 
     if hazard in ("river", "coastal"):
-        uncertainties += [
-            CategoricalParameter("flood_mapping", FLOOD_MAPPINGS),
-            RealParameter("flood_frag_median", 0.3, 1.0),
-            RealParameter("flood_frag_beta", 0.2, 0.6),
-            RealParameter("flood_threshold", 0.1, 0.6),
-            RealParameter("depth_scale", 0.9, 1.1),
-        ]
-        treatment = _PROT_TREATMENT[scenario]
-        if treatment == "scale":
-            uncertainties.append(RealParameter("protection_scale", 0.0, 2.0))
-        elif treatment == "abs":
-            uncertainties.append(RealParameter("protection_abs_rp", 5.0, 200.0))
-        else:
-            constants.append(Constant("protection_scale", 1.0))
+        # flood_mapping / flood_frag_median / flood_frag_beta / flood_threshold
+        # are gone: they parameterised an INVENTED depth -> failure mapping that
+        # existed only because V1.1.0 had no flood fragility for power. V3.0.0
+        # has F2.4/F2.5 for substations, which `_fragility_params` now supplies
+        # as `curve_bus`, and nothing for lines, which are therefore immune.
+        #
+        # Protection is gone too: it is applied post-hoc to the stored event
+        # table, in the PRESENT-DAY frame. Applying it here against the
+        # climate-shifted return periods made warming appear to strengthen
+        # defences - at a 200-year standard flood EAENS fell to exactly zero
+        # from 2.0C upward.
+        uncertainties.append(RealParameter("depth_scale", 0.9, 1.1))
         if hazard == "river":
             # The climate RP shift is river-basin-anchor based; coastal
             # sea-level rise is a separate mechanism, not modelled here.
@@ -205,10 +208,18 @@ def build_model(cfg: dict | None = None) -> Model:
         uncertainties.append(RealParameter("pga_scale", 0.8, 1.2))
     elif hazard == "windstorm":
         uncertainties.append(RealParameter("gust_scale", 0.9, 1.1))
-        if scenario == "net_windstorm_absprot":
-            uncertainties.append(RealParameter("protection_abs_rp", 25.0, 200.0))
 
     constants += [
+        # Fixed to HydroBASINS level 07 for every hazard, matching the partner
+        # analyses. FOOTPRINT_LEVELS and _footprint_labels keep the other levels
+        # so a sensitivity run is a config change, not a code change.
+        Constant("event_footprint", netcfg.get("event_footprint", "basin_lev07")),
+        # DC OPF always. Sampling {connectivity, dc_opf} meant half the draws
+        # never ran an OPF - and connectivity cannot see capacity-constrained
+        # shedding, which is the whole reason the OPF is here now that thermal
+        # limits are enforced. Mixing them also made every aggregate a blend of
+        # two different models.
+        Constant("network_model", "dc_opf"),
         Constant("include_river", hazard == "river"),
         Constant("include_coastal", hazard == "coastal"),
         Constant("include_earthquake", hazard == "earthquake"),

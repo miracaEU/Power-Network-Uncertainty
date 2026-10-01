@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .disaggregation import MODES
 from .network import ISO2_TO_ISO3, NO_OPSD_DEMAND, OPSD_DEMAND_ALIAS
 
 DEMAND_COL = "_load_actual_entsoe_transparency"
@@ -92,33 +93,65 @@ def archetype_timestamp(em_dir: Path, iso2: str, archetype: str) -> pd.Timestamp
 
 
 def bus_load_mw(net, demand: dict[str, float], mode: str = "equal",
-                weights: np.ndarray | None = None) -> tuple[np.ndarray, list[str]]:
+                weights: np.ndarray | None = None,
+                exclude: np.ndarray | None = None) -> tuple[np.ndarray, list[str]]:
     """Split national demand across buses. Returns (load per bus, missing ISO2).
 
     "equal"  splits a country's demand evenly across its buses - what the D3.3
              model does, kept as the default so results stay comparable.
-    "weights" uses a caller-supplied per-bus weight (e.g. NUTS3 population or
-             GDP), renormalised within each country.
+    "nuts3", "nuts3_pop", "nuts3_gdp"
+             use per-bus weights from `disaggregation.nuts3_bus_weights`,
+             renormalised within each country.
+
+    The weights are supplied by the caller rather than built here so that the
+    spatial join happens once per model build instead of once per evaluation.
+    A non-equal mode with `weights=None` is a caller error and raises: it used
+    to fall through to the equal split, which meant setting the config switch
+    silently changed nothing at all.
+
+    Weights are honoured per country, not globally. A country whose weights are
+    not all finite - no NUTS3 geometry, or no Eurostat statistics - falls back
+    to the equal split on its own, so one uncovered country does not force
+    every other country back onto the placeholder.
 
     Countries absent from `demand` are left at ZERO and reported. They are never
     given an invented default: D3.3's `.fillna(500.0)` MW-per-bus fallback is
     the traceable origin of its 245,864 MW artefact.
     """
+    if mode not in MODES:
+        raise ValueError(
+            f"unknown load_disaggregation '{mode}'; choose from {list(MODES)}"
+        )
+    if mode != "equal" and weights is None:
+        raise ValueError(
+            f"load_disaggregation '{mode}' needs per-bus weights; call "
+            "disaggregation.nuts3_bus_weights and pass them in"
+        )
+
     zone = net.bus["zone"].fillna("").to_numpy()
     load = np.zeros(len(net.bus))
     missing: list[str] = []
+    w_all = None if weights is None else np.asarray(weights, np.float64)
+    # `exclude` drops buses from the split entirely - they get zero load AND
+    # leave the denominator, so the country's demand is redistributed over the
+    # buses that remain rather than vanishing. Used for HVDC converter
+    # terminals, which are stations rather than demand centres; see
+    # hvdc.dc_terminal_mask.
+    skip = (np.zeros(len(net.bus), bool) if exclude is None
+            else np.asarray(exclude, bool))
     for iso2 in sorted(set(zone) - {""}):
-        mask = zone == iso2
+        mask = (zone == iso2) & ~skip
+        if not mask.any():
+            continue
         total = demand.get(iso2)
         if total is None or not np.isfinite(total):
             missing.append(iso2)
             continue
-        if mode == "equal" or weights is None:
+        w = None if w_all is None else w_all[mask]
+        if w is None or not np.all(np.isfinite(w)) or w.sum() <= 0:
             load[mask] = total / mask.sum()
         else:
-            w = np.asarray(weights, np.float64)[mask]
-            s = w.sum()
-            load[mask] = total * (w / s if s > 0 else 1.0 / mask.sum())
+            load[mask] = total * (w / w.sum())
     return load, missing
 
 

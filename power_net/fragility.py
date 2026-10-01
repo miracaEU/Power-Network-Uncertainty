@@ -14,12 +14,22 @@ What the MIRACA Table D2 workbook actually contains (checked, not assumed):
   E_Frag_PGA    162 earthquake fragility curves, incl. E2.x substations,
                 E3.x towers, E4.x poles, E6.x lines/cables. Some are tabulated
                 exceedance probabilities, some parametric (median/beta).
-  F_Frag_*      3 flood fragility curves, all highways, plus railway
-                overtopping. **No flood fragility for power exists.**
+  F_Frag_Depth  Flood fragility on a depth axis. In V1.1.0 this sheet did not
+                exist and the only flood curves for power were damage ratios, so
+                the study converted them to failure probabilities under a
+                sampled, invented mapping. **V3.0.0 adds F2.4 and F2.5, real
+                substation flood fragility curves**, and the invention is gone.
 
-That last gap is the sharpest epistemic hole in the study, so rather than hide
-it behind one invented curve, the depth -> failure mapping is a sampled
-categorical factor with three defensible readings (FLOOD_MAPPINGS).
+What is still missing, and is now stated rather than papered over: V3.0.0 has NO
+flood fragility for lines, cables, towers or poles - only damage ratios. Rather
+than invent a depth -> failure mapping for them, **lines are flood-immune**.
+That is defensible for a high-voltage tower under slow-onset flooding, and it is
+a scope statement, not an oversight. Flood and coastal ENS therefore arise from
+substation failure alone.
+
+FLOOD_MAPPINGS and load_flood_damage_curves are retained only so the superseded
+construction can be reproduced for comparison; nothing in the live model path
+uses them.
 
 Damage states are ordinal; which one counts as "failed" is itself a modelling
 choice (failure_state), not a constant.
@@ -267,11 +277,54 @@ FLOOD_CURVES = {
     "line": ["F6.1", "F6.2"],
 }
 
-SHEET_FOR_HAZARD = {"windstorm": "W_Frag_V10m", "earthquake": "E_Frag_PGA"}
-GROUPS_FOR_HAZARD = {"windstorm": WIND_FRAGILITY, "earthquake": EQ_FRAGILITY}
+# Real flood FRAGILITY, from V3.0.0's F_Frag_Depth sheet. These did not exist in
+# V1.1.0, which is why this study used to invent one.
+#
+#   F2.4  Substation, intense short event (<3 h)   median 0.111 m, beta 0.208
+#   F2.5  Substation, prolonged event   (<10 h)    median 0.226 m, beta 0.208
+#
+# Both are 3-5x MORE fragile than the invented lognormal they replace (which
+# defaulted to median 0.6 m, beta 0.4), so adopting them raises substation flood
+# failure substantially.
+#
+# There is NO entry for "line". V3.0.0 has no flood fragility for lines, cables,
+# towers or poles - only damage-ratio curves, and converting those to failure
+# probabilities is exactly the invention this study no longer makes. Lines are
+# therefore flood-immune, which is physically defensible for a high-voltage
+# tower under slow-onset flooding but must be stated, not assumed.
+# Chosen per hazard rather than sampled, because at the depths that actually
+# occur the two curves are indistinguishable: measured across ITA and NLD, 80-82%
+# of flood-exposed transmission buses sit above 0.5 m and median depth is
+# 1.0-1.4 m, while F2.4 saturates at ~0.30 m and F2.5 at ~0.50 m. Both return
+# P(fail) = 1.0 over essentially the whole exposed population - sampling between
+# them would spend a Sobol dimension on a constant, as `slack_placement` did.
+#
+# The split follows event duration, which is what actually distinguishes the two
+# curves: river floods are prolonged (F2.5, <10 h), coastal surge is short-lived
+# (F2.4, <3 h).
+FLOOD_FRAGILITY_RIVER = {"bus": ["F2.5"]}
+FLOOD_FRAGILITY_COASTAL = {"bus": ["F2.4"]}
+
+# Both, for the sensitivity run that demonstrates the choice does not matter.
+FLOOD_FRAGILITY = {"bus": ["F2.4", "F2.5"]}
+
+SHEET_FOR_HAZARD = {
+    "windstorm": "W_Frag_V10m",
+    "earthquake": "E_Frag_PGA",
+    "river": "F_Frag_Depth",
+    "coastal": "F_Frag_Depth",   # no surge-specific curve exists in V3.0.0
+}
+GROUPS_FOR_HAZARD = {
+    "windstorm": WIND_FRAGILITY,
+    "earthquake": EQ_FRAGILITY,
+    "river": FLOOD_FRAGILITY_RIVER,
+    "coastal": FLOOD_FRAGILITY_COASTAL,
+}
 
 # The wind sheet's axis is 10 m sustained wind; hazard rasters are 3-sec gusts.
-AXIS_SCALE = {"windstorm": GUST_3SEC_FACTOR, "earthquake": 1.0}
+# Flood axes are depth in metres on both sides, so no conversion.
+AXIS_SCALE = {"windstorm": GUST_3SEC_FACTOR, "earthquake": 1.0,
+              "river": 1.0, "coastal": 1.0}
 
 
 def load_component_fragility(vulnerability_path, hazard: str,

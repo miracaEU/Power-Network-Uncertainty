@@ -24,7 +24,10 @@ cache_dir: "cache"
 # Relative to the repo root, so it resolves on both platforms.
 energy_model_dir: "Energy Model"
 
-vulnerability_path: "/scistor/ivm/eks510/projects/AssetRisk_PanEU/data/Table_D2_Hazard_Fragility_and_Vulnerability_Curves_V1.1.0_conversions.xlsx"
+# V3.0.0 - see config.network.yml. Relative to the repo so it resolves on both
+# sides: the workbook lives in the Energy Model drop, which is synced with the
+# repo rather than living in eks510's space.
+vulnerability_path: "Energy Model/Table_D2_Multi-Hazard_Fragility_and_Vulnerability_Curves_V3.0.0_AUTH.xlsx"
 fragility_path: "/scistor/ivm/eks510/projects/AssetRisk_PanEU/data/EQ_fragility.xlsx"
 basin_data_path: "/scistor/ivm/eks510/projects/AssetRisk_PanEU/data/basins_abs_shift_return_periods.parquet"
 
@@ -36,8 +39,34 @@ network:
   unmatched_bus_policy: immune
   snap_max_m: 25000.0
   intensity_aggregation: max
-  load_disaggregation: equal
-  # Off: with the equal-split disaggregation 12.9% of lines already exceed
-  # 100% loading before any hazard, so a limited OPF does not converge even in
-  # the base case. See BENCHMARK.md.
-  thermal_limits: false
+  # equal | nuts3 | nuts3_pop | nuts3_gdp - see config.network.yml for what
+  # each does and which countries fall back to the equal split.
+  event_footprint: basin_lev07
+  load_disaggregation: nuts3
+  nuts3_year: 2021
+  nuts3_gdp_weight: 0.5
+  # See config.network.yml for what each of these does and the measurements
+  # behind the defaults. All four changed on 2026-09-16, and together they make
+  # the base case a physically possible operating point for the first time:
+  # the DC layer is read, converter terminals no longer receive national demand,
+  # the OPF is solved as an LP with HiGHS, and line ratings are enforced.
+  # Results from before that date are NOT comparable - the structural floor was
+  # 3,522 MW of phantom load on unconnected HVDC terminals and is now 0.
+  include_hvdc: true
+  exclude_dc_terminal_load: true
+  opf_backend: highs
+  dispatch_objective: economic
+  # On. The 12.9% of lines over 100% that previously blocked this was neither
+  # the load disaggregation nor the missing HVDC - both were tested and cleared
+  # - but the unconstrained economic dispatch itself. PIPS could not converge
+  # with limits; HiGHS does, in seconds.
+  thermal_limits: true
+  # AL, BA, MD, MK, XK have no OPSD demand series, so their 85 buses carry zero
+  # load but keep 11.53 GW of generation - in the base case they dispatch
+  # 6.7 GW with nothing to serve, making Bosnia the 4th largest exporter in the
+  # model. `keep_generation` leaves that alone (the honest picture of the input
+  # data); `neutral` also switches their generation off, so they are pure
+  # transit. EAENS is insensitive either way (<0.03%, both signs - see
+  # `_apply_zero_load_policy`), because ENS is a difference of two solves that
+  # both contain the artefact and the residual shed is delivery-limited.
+  zero_load_country_policy: keep_generation

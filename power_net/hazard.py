@@ -130,23 +130,51 @@ def build_component_hazard(cfg: dict, link: Linkage, hazard: str,
         hybas = np.zeros(n_comp, dtype=np.int64)
         anchors = np.zeros((n_comp, 3, 4))
         matched = np.zeros(n_comp, dtype=bool)
+        # Coastal protection is a different standard from river protection:
+        # COASTPROS-EU joined to NUTS2, not FLOPROS. Stage 1 writes it as
+        # `coast_prot_rp` for coastal countries only. It was never loaded, so
+        # coastal scenarios ran against the river standard - for PRT that is
+        # 55.2 yr instead of 141.8 yr, i.e. ~2.6x too permissive.
+        prot_col = ("coast_prot_rp"
+                    if hazard == "coastal" and "coast_prot_rp" in seg.columns
+                    else "prot_rp")
         if len(cmap):
             g = cmap.merge(
-                seg[["prot_rp", "HYBAS_ID"] + ANCHOR_COLS].reset_index(names="seg"),
+                seg[[prot_col, "HYBAS_ID"] + ANCHOR_COLS].reset_index(names="seg"),
                 on="seg", how="left",
             )
             byc = g.groupby("comp_idx")
             idx = byc.size().index.to_numpy()
             matched[idx] = True
-            prot[idx] = byc["prot_rp"].min().to_numpy()
+            prot[idx] = byc[prot_col].min().to_numpy()
             # Modal basin: a component spanning basins is assigned the one most
             # of its features sit in, so footprint membership stays single-valued.
             hybas[idx] = byc["HYBAS_ID"].agg(
                 lambda s: s.mode().iloc[0] if len(s.mode()) else 0
             ).to_numpy()
-            anchors[idx] = (
-                byc[ANCHOR_COLS].mean().to_numpy().reshape(-1, 3, 4)
-            )
+            # Clip and NaN-fill the warming anchors exactly as the direct-damage
+            # original does (miraca_uq.risk_model, ANCHOR_CLIPS): a shifted
+            # return period outside the source grid's support is extrapolation,
+            # not signal, and NaN silently propagates through _shift_rps into
+            # the integration grid. PRT carries 7,305 NaN per anchor column and
+            # maxima well outside the clips (new_rp500_w40 reaches 3,634 against
+            # a 1,000 ceiling); LUX is clean, which is why the benchmark never
+            # showed this.
+            a = byc[ANCHOR_COLS].mean().to_numpy().reshape(-1, 3, 4)
+            nominal = np.array([10.0, 100.0, 500.0])[None, :, None]
+            a = np.where(np.isfinite(a), a, np.broadcast_to(nominal, a.shape))
+            lo = np.array([1.0, 1.0, 1.0])[None, :, None]
+            hi = np.array([99.0, 499.0, 1000.0])[None, :, None]
+            a = np.clip(a, lo, hi)
+            # Force the (RP10, RP100, RP500) anchors to be non-decreasing. They
+            # are a groupby-mean over a component's features, so averaging and
+            # clipping can leave them out of order, which makes `_shift_rps`
+            # non-monotone - and a non-monotone shift both unsorts the
+            # integration grid and breaks the equivalence between testing
+            # protection in the present-day frame and in the shifted frame
+            # (see the plan, section 6.1). Monotone anchors make that
+            # equivalence hold by construction rather than by luck.
+            anchors[idx] = np.maximum.accumulate(a, axis=1)
         out[kind] = {"intensity": intensity, "prot_rp": prot, "hybas": hybas,
                      "anchors": anchors, "matched": matched}
     return out

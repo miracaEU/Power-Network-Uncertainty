@@ -43,3 +43,12 @@ networkx
 # pandapower warns on every solve without it and falls back to a slower
 # admittance-matrix build.
 numba
+
+# NUTS3 load disaggregation (power_net/disaggregation.py): the point-in-polygon
+# and nearest-polygon joins that place each bus in a statistical region. Both
+# also arrive with the direct-damage stack, but this repo now imports them
+# directly, so they are declared rather than relied on transitively - pyproj
+# has been an undeclared import in network.py and injections.py since the
+# start.
+geopandas
+pyproj
